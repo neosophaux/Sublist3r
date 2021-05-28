@@ -141,7 +141,8 @@ def subdomain_sorting_key(hostname):
 
 
 class enumratorBase(object):
-    def __init__(self, base_url, engine_name, domain, subdomains=None, silent=False, verbose=True):
+    def __init__(self, base_url, engine_name, domain, subdomains=None, silent=False, verbose=True,
+                 needs_xtra_processing = True):
         subdomains = subdomains or []
         self.domain = urlparse.urlparse(domain).netloc
         self.session = requests.Session()
@@ -151,6 +152,7 @@ class enumratorBase(object):
         self.engine_name = engine_name
         self.silent = silent
         self.verbose = verbose
+        self.needs_xtra_processing = needs_xtra_processing
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -170,8 +172,11 @@ class enumratorBase(object):
         return
 
     def send_req(self, query, page_no=1):
+        if self.needs_xtra_processing:
+            url = self.base_url.format(query=query, page_no=page_no)
+        else:
+            url = self.base_url
 
-        url = self.base_url.format(query=query, page_no=page_no)
         try:
             resp = self.session.get(url, headers=self.headers, timeout=self.timeout)
         except Exception:
@@ -211,7 +216,7 @@ class enumratorBase(object):
 
     def generate_query(self):
         """ chlid class should override this function """
-        return
+        return ''
 
     def get_page(self, num):
         """ chlid class that user different pagnation counter should override this function """
@@ -257,9 +262,11 @@ class enumratorBase(object):
 
 
 class enumratorBaseThreaded(multiprocessing.Process, enumratorBase):
-    def __init__(self, base_url, engine_name, domain, subdomains=None, q=None, silent=False, verbose=True):
+    def __init__(self, base_url, engine_name, domain, subdomains=None, q=None, silent=False, verbose=True,
+                 needs_xtra_processing = True):
         subdomains = subdomains or []
-        enumratorBase.__init__(self, base_url, engine_name, domain, subdomains, silent=silent, verbose=verbose)
+        enumratorBase.__init__(self, base_url, engine_name, domain, subdomains, silent=silent, verbose=verbose,
+            needs_xtra_processing = needs_xtra_processing)
         multiprocessing.Process.__init__(self)
         self.q = q
         return
@@ -269,6 +276,82 @@ class enumratorBaseThreaded(multiprocessing.Process, enumratorBase):
         for domain in domain_list:
             self.q.append(domain)
 
+class CloudFlareEnum(enumratorBaseThreaded):
+    def __init__(self, domain, subdomains = None, q = None, silent = False, verbose = True):
+        self.engine_name = 'c99.nl'
+        self.c99nl_key = ''
+        self.base_url = "https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json" % (self.c99nl_key, domain)
+        self.MAX_DOMAINS = 0
+        self.MAX_PAGES = 0
+
+        super(CloudFlareEnum, self).__init__(
+            self.base_url,
+            self.engine_name,
+            domain,
+            subdomains,
+            q = q,
+            silent = silent,
+            verbose = verbose,
+            needs_xtra_processing = False
+        )
+
+    def req(self, url):
+        try:
+            resp = self.session.get(url, headers=self.headers, timeout=self.timeout)
+        except Exception:
+            resp = None
+
+        return self.get_response(resp)
+
+    def enumerate(self):
+        if len(self.c99nl_key) == 0:
+            self.print_(R + '[!] Error: Missing api key for api.c99.nl. The use of this service will be skipped.')
+
+            return self.subdomains
+        
+        resp = self.req(self.base_url)
+
+        if not self.check_response_errors(resp):
+            return self.subdomains
+
+        self.extract_domains(resp)
+
+        return self.subdomains
+
+    def check_response_errors(self, resp):
+        try:
+            resp_json = json.loads(resp)
+
+            if resp_json['success'] == 'false':
+                self.print_(R + "[!] Error: c99.nl returned the following error:" + W)
+                self.print_(R + ("[!] %s" % resp_json['error']) + W)
+
+                return False
+
+            return True
+        except (json.JSONDecodeError, KeyError):
+            return False
+
+    def extract_domains(self, resp):
+        try:
+            resp_json = json.loads(resp)
+
+            if 'cached' in resp_json and resp_json['cached']:
+                self.print_("%s%s:%s Cached since %s" % (R, self.engine_name, W, resp_json['cache_time']))
+
+            for sub in resp_json['subdomains']:
+                if sub['ip'] == 'none':
+                    continue
+
+                subdomain = sub['subdomain']
+
+                if subdomain not in self.subdomains and subdomain != self.domain:
+                    if self.verbose:
+                        self.print_("%s%s: %s%s" % (R, self.engine_name, W, subdomain))
+
+                    self.subdomains.append(subdomain.strip())
+        except (json.JSONDecodeError, KeyError):
+            self.print_(R + "[!] Outdated c99.nl parser." + W)
 
 class GoogleEnum(enumratorBaseThreaded):
     def __init__(self, domain, subdomains=None, q=None, silent=False, verbose=True):
@@ -915,6 +998,7 @@ def main(domain, threads, savefile, ports, silent, verbose, enable_bruteforce, e
     supported_engines = {'baidu': BaiduEnum,
                          'yahoo': YahooEnum,
                          'google': GoogleEnum,
+                         'c99.nl': CloudFlareEnum,
                          'bing': BingEnum,
                          'ask': AskEnum,
                          'netcraft': NetcraftEnum,
@@ -929,6 +1013,7 @@ def main(domain, threads, savefile, ports, silent, verbose, enable_bruteforce, e
 
     if engines is None:
         chosenEnums = [
+            CloudFlareEnum,
             BaiduEnum, YahooEnum, GoogleEnum, BingEnum, AskEnum,
             NetcraftEnum, DNSdumpster, Virustotal, ThreatCrowd,
             CrtSearch, PassiveDNS
